@@ -1,0 +1,58 @@
+name: CI
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # nécessaire pour la signature Cosign sans clé
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/myapp
+
+jobs:
+  security-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: GitLeaks (secrets)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Bandit (SAST)
+        run: pip install bandit && bandit -r app.py
+      - name: Safety (dépendances)
+        run: pip install safety && safety check -r requirements.txt
+
+  build-and-sign:
+    needs: security-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        run: docker build -t $IMAGE:${{ github.sha }} .
+      - name: Trivy (scan image)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: 1          # le pipeline échoue si vulnérabilité grave
+          ignore-unfixed: true
+      - name: SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Push
+        run: docker push $IMAGE:${{ github.sha }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign image (Cosign keyless)
+        run: cosign sign --yes $IMAGE@$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:${{ github.sha }} | cut -d@ -f2)
