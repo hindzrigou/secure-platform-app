@@ -5,11 +5,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write   # nécessaire pour la signature Cosign sans clé
-
-env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/myapp
+  id-token: write
 
 jobs:
   security-checks:
@@ -31,28 +27,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-west-3
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
       - name: Build
-        run: docker build -t $IMAGE:${{ github.sha }} .
+        run: docker build -t ${{ steps.login-ecr.outputs.registry }}/myapp:${{ github.sha }} .
       - name: Trivy (scan image)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/myapp:${{ github.sha }}
           severity: CRITICAL,HIGH
           exit-code: 1          # le pipeline échoue si vulnérabilité grave
           ignore-unfixed: true
       - name: SBOM (Syft)
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.IMAGE }}:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/myapp:${{ github.sha }}
           format: spdx-json
           output-file: sbom.spdx.json
       - name: Push
-        run: docker push $IMAGE:${{ github.sha }}
+        run: docker push ${{ steps.login-ecr.outputs.registry }}/myapp:${{ github.sha }}
       - uses: sigstore/cosign-installer@v3
       - name: Sign image (Cosign keyless)
-        run: cosign sign --yes $IMAGE@$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:${{ github.sha }} | cut -d@ -f2)
+        run: |
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/myapp:${{ github.sha }}"
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
+          cosign sign --yes "${{ steps.login-ecr.outputs.registry }}/myapp@${DIGEST}"
